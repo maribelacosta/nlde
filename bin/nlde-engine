@@ -1,0 +1,205 @@
+#!/usr/bin/env python
+
+"""
+Created on Mar 25, 2015
+
+@author: Maribel Acosta
+"""
+import argparse
+import os
+import signal
+import sys
+from multiprocessing import active_children, Queue
+from time import time
+
+from nlde.engine.eddynetwork import EddyNetwork
+from nlde.policy.nopolicy import NoPolicy
+from nlde.policy.ticketpolicy import TicketPolicy
+from nlde.policy.uniformrandompolicy import UniformRandomPolicy
+
+
+def get_options():
+
+    parser = argparse.ArgumentParser(description="nLDE: An engine to execute "
+                                                 "SPARQL queries over Triple Pattern Fragments")
+
+    # nLDE arguments.
+    parser.add_argument("-s", "--server",
+                        help="URL of the triple pattern fragment server (required)")
+    parser.add_argument("-f", "--file",
+                        help="file name of the SPARQL query (required, or -q)")
+    parser.add_argument("-q", "--query",
+                        help="SPARQL query (required, or -f)")
+    parser.add_argument("-r", "--results",
+                        help="format of the output results",
+                        choices=["y", "n", "all"],
+                        default="y")
+    parser.add_argument("-e", "--eddies",
+                        help="number of eddy processes to create",
+                        type=int,
+                        default=2)
+    parser.add_argument("-p", "--policy",
+                        help="routing policy used by eddy operators",
+                        choices=["NoPolicy", "Ticket", "Random"],
+                        default="NoPolicy")
+    parser.add_argument("-t", "--timeout",
+                        help="query execution timeout",
+                        type=int)
+    args = parser.parse_args()
+
+    # Handling mandatory arguments.
+    err = False
+    msg = []
+    if not args.server:
+        err = True
+        msg.append("error: no server specified. Use argument -s to specify the address of a server.")
+
+    if not args.file and not args.query:
+        err = True
+        msg.append("error: no query specified. Use argument -f or -q to specify a query.")
+
+    if err:
+        parser.print_usage()
+        print "\n".join(msg)
+        sys.exit(1)
+
+    return args.server, args.file, args.query, args.eddies, args.timeout, args.results, args.policy
+
+
+class NLDE (object):
+    def __init__(self, source, queryfile, query, eddies, timeout, printres, policy_str):
+        self.source = source
+        self.queryfile = queryfile
+        self.query = query
+        self.query_id = ""
+        self.eddies = eddies
+        self.timeout = timeout
+        self.printres = printres
+        self.policy_str = policy_str
+        self.network = None
+        self.p_list = None
+        self.res = Queue()
+
+        # Open query.
+        if self.queryfile:
+            self.query = open(self.queryfile).read()
+            self.query_id = self.queryfile[self.queryfile.rfind("/") + 1:]
+
+        # Set routing policy.
+        if self.policy_str == "NoPolicy":
+            self.policy = NoPolicy()
+        elif self.policy_str == "Ticket":
+            self.policy = TicketPolicy()
+        elif self.policy_str == "Random":
+            self.policy = UniformRandomPolicy()
+
+        # Set execution variables.
+        self.init_time = None
+        self.time_first = None
+        self.time_total = None
+        self.card = 0
+        self.xerror = ""
+
+        # Set execution timeout.
+        if self.timeout:
+            signal.signal(signal.SIGALRM, self.call_timeout)
+            signal.alarm(self.timeout)
+
+    def execute(self):
+        # Initialization timestamp.
+        self.init_time = time ()
+
+        # Create eddy network.
+        network = EddyNetwork(self.query, self.policy, source=fragment, n_eddy=eddies)
+        self.p_list = network.p_list
+
+        network.execute(self.res)
+
+        if self.printres == "y":
+            self.print_solutions()
+        elif self.printres == "all":
+            self.print_all()
+        else:
+            self.print_basics()
+
+        self.summary()
+
+    # Print only basic stats, but still iterate over results.
+    def print_basics(self):
+
+        ri = self.res.get(True)
+        self.time_first = time() - self.init_time
+
+        while ri.data != "EOF":
+            self.card = self.card + 1
+            ri = self.res.get(True)
+
+        self.time_total = time() - self.init_time
+
+    # Print only solution mappings.
+    def print_solutions(self):
+
+        ri = self.res.get(True)
+        self.time_first = time() - self.init_time
+
+        while ri.data != "EOF":
+            self.card = self.card + 1
+            print str(ri.data)
+            ri = self.res.get(True)
+
+        self.time_total = time() - self.init_time
+
+    # Print all stats for each solution mapping.
+    def print_all(self):
+
+        ri = self.res.get(True)
+        ts = time()
+        self.time_first = ts - self.init_time
+
+        while ri.data != "EOF":
+            self.card = self.card + 1
+            t = ts - self.init_time
+            print self.query_id + "\t" + str(ri.data) + "\t" + str(t) + "\t" + str(self.card)
+            ri = self.res.get(True)
+            ts = time()
+
+        self.time_total = time() - self.init_time
+
+    # Final stats of execution.
+    def summary(self):
+        self.res.close()
+
+        print self.query_id + "\t" + str(self.time_first) + "\t" + str(self.time_total) + \
+              "\t" + str(self.card) + "\t" + str(self.xerror)
+
+    # Timeout was fired.
+    def call_timeout(self):
+        self.xerror = "Timeout"
+        self.finalize()
+        self.summary()
+        sys.exit(1)
+
+    # Finalize execution: kill sub-processes.
+    def finalize(self):
+
+        while not self.p_list.empty():
+            pid = self.p_list.get()
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError as e:
+                pass
+
+        for p in active_children():
+            try:
+                p.terminate()
+            except OSError as e:
+                pass
+
+
+if __name__ == '__main__':
+    (fragment, queryfile, query, eddies, timeout, printres, policy_str) = get_options()
+
+    nlde = NLDE(fragment, queryfile, query, eddies, timeout, printres, policy_str)
+    nlde.execute()
+    nlde.finalize()
+    sys.exit(0)
